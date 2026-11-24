@@ -1,93 +1,47 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from skfem import *
 
-
-def run_3d_fem_thermal(k_sub):
-    Lx, Ly = 250e-6, 150e-6
-
-    z_sub = np.linspace(0, 50e-6, 12)
-    z_kap = np.linspace(50e-6, 50.1e-6, 4)[1:]
-    z_ox = np.linspace(50.1e-6, 50.4e-6, 6)[1:]
-    z_wg = np.linspace(50.4e-6, 50.6e-6, 4)[1:]
-    Z = np.concatenate([z_sub, z_kap, z_ox, z_wg])
-
-    X = np.linspace(0, Lx, 35)
-    Y = np.linspace(0, Ly, 30)
-
-    mesh = MeshHex().init_tensor(X, Y, Z)
-    basis = Basis(mesh, ElementHex1())
-
-    R_kapitza = 1e-8
-    d_kap = 0.1e-6
-    k_kap = d_kap / R_kapitza
-    k_ox = 1.4
-    k_wg = 148.0
-
+def solve_3d_thermal_fdm(k_sub, rho_cp, pitch_um=25.0, t_sw=5e-6):
+    nx, ny, nz = 26, 41, 27
+    dx, dy, dz = 10e-6, 2.5e-6, 2e-6
+    k = np.full((nx, ny, nz), k_sub, dtype=np.float64)
+    k[:, :, -1] = 1.4
+    Q = np.zeros((nx, ny, nz), dtype=np.float64)
     P_heater = 15e-3
-    V_heater = 200e-6 * 15e-6 * 0.2e-6
-    q_vol = P_heater / V_heater
+    vol_heater = 100e-6 * 7.5e-6 * dz
+    Q[:11, :4, -1] = (P_heater / 4.0) / vol_heater
+    T = np.zeros((nx, ny, nz), dtype=np.float64)
 
-    @BilinearForm
-    def conduction(u, v, w):
-        z = w.x[2]
-        k = np.where(z <= 50e-6, k_sub,
-            np.where(z <= 50.1e-6, k_kap,
-            np.where(z <= 50.4e-6, k_ox, k_wg)))
-        return k * (u.grad[0] * v.grad[0] + u.grad[1] * v.grad[1] + u.grad[2] * v.grad[2])
+    kx_p = 2 * k[:-1, :, :] * k[1:, :, :] / (k[:-1, :, :] + k[1:, :, :]) / (dx ** 2)
+    ky_p = 2 * k[:, :-1, :] * k[:, 1:, :] / (k[:, :-1, :] + k[:, 1:, :]) / (dy ** 2)
+    kz_p = 2 * k[:, :, :-1] * k[:, :, 1:] / (k[:, :, :-1] + k[:, :, 1:]) / (dz ** 2)
 
-    @LinearForm
-    def heat_source(v, w):
-        x, y, z = w.x[0], w.x[1], w.x[2]
-        in_heater = (x <= 100e-6) & (y <= 7.5e-6) & (z > 50.4e-6)
-        return np.where(in_heater, q_vol * v, 0.0)
+    for _ in range(1500):
+        T_pad = np.pad(T, ((1, 1), (1, 1), (1, 1)), mode="edge")
+        T_pad[:, :, 0] = 0.0
+        flux_x = np.pad(kx_p, ((1, 0), (0, 0), (0, 0)), mode="edge") * (T_pad[:-2, 1:-1, 1:-1] - T) + \
+                 np.pad(kx_p, ((0, 1), (0, 0), (0, 0)), mode="edge") * (T_pad[2:, 1:-1, 1:-1] - T)
+        flux_y = np.pad(ky_p, ((0, 0), (1, 0), (0, 0)), mode="edge") * (T_pad[1:-1, :-2, 1:-1] - T) + \
+                 np.pad(ky_p, ((0, 0), (0, 1), (0, 0)), mode="edge") * (T_pad[1:-1, 2:, 1:-1] - T)
+        flux_z = np.pad(kz_p, ((0, 0), (0, 0), (1, 0)), mode="edge") * (T_pad[1:-1, 1:-1, :-2] - T) + \
+                 np.pad(kz_p, ((0, 0), (0, 0), (0, 1)), mode="edge") * (T_pad[1:-1, 1:-1, 2:] - T)
+        denom = np.pad(kx_p, ((1, 0), (0, 0), (0, 0)), mode="edge") + np.pad(kx_p, ((0, 1), (0, 0), (0, 0)), mode="edge") + \
+                np.pad(ky_p, ((0, 0), (1, 0), (0, 0)), mode="edge") + np.pad(ky_p, ((0, 0), (0, 1), (0, 0)), mode="edge") + \
+                np.pad(kz_p, ((0, 0), (0, 0), (1, 0)), mode="edge") + np.pad(kz_p, ((0, 0), (0, 0), (0, 1)), mode="edge")
+        T = T + 0.8 * ((flux_x + flux_y + flux_z + Q) / denom)
+        T[:, :, 0] = 0.0
 
-    A = asm(conduction, basis)
-    b = asm(heat_source, basis)
-
-    bottom_dofs = basis.get_dofs(lambda x: np.isclose(x[2], 0.0))
-    A_bc, b_bc = enforce(A, b, D=bottom_dofs)
-
-    dT_fem = solve(A_bc, b_bc)
-
-    coords = basis.doflocs
-    wg_mask = (coords[0] <= 100e-6) & (coords[1] <= 7.5e-6) & (coords[2] > 50.4e-6)
-    avg_dT = np.mean(dT_fem[wg_mask])
-
-    return coords, dT_fem, avg_dT
-
+    idx_nbr = int(round((pitch_um * 1e-6) / dy))
+    dT_act = float(np.mean(T[:11, :4, -1]))
+    dT_nbr = float(np.mean(T[:11, max(0, idx_nbr - 2):idx_nbr + 3, -1]))
+    xtalk = dT_nbr / dT_act
+    alpha = k_sub / rho_cp
+    tau_diff = (50e-6 ** 2) / alpha
+    mem = float(np.exp(-t_sw / (tau_diff + 5.5e-6)))
+    return dT_act, dT_nbr, xtalk, mem
 
 if __name__ == "__main__":
-    coords_si, dT_si, avg_si = run_3d_fem_thermal(148.0)
-    coords_bas, dT_bas, avg_bas = run_3d_fem_thermal(1300.0)
-
-    print("=== 3D FEM SIMULATION RESULTS (Single Tile) ===")
-    print(f"Si Substrate  (k = 148 W/m*K):  Local waveguide overheating = {avg_si:.3f} K")
-    print(f"BAs Substrate (k = 1300 W/m*K): Local waveguide overheating = {avg_bas:.3f} K")
-    print(f"Heat dissipation efficiency improvement: {avg_si / avg_bas:.2f}x")
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5), dpi=150)
-    top_mask = np.isclose(coords_si[2], np.max(coords_si[2]))
-
-    x_um = coords_si[0][top_mask] * 1e6
-    y_um = coords_si[1][top_mask] * 1e6
-    vmax = np.max(dT_si[top_mask])
-
-    for ax, dT, title in zip(
-        axes,
-        [dT_si[top_mask], dT_bas[top_mask]],
-        [f"Si Substrate (ΔT_wg = {avg_si:.2f} K)", f"BAs Substrate (ΔT_wg = {avg_bas:.2f} K)"]
-    ):
-        tc = ax.tricontourf(x_um, y_um, dT, levels=40, cmap="inferno", vmin=0, vmax=vmax)
-        ax.set_title(title, fontsize=12, fontweight="bold")
-        ax.set_xlabel("X, μm (Length from center)")
-        ax.set_ylabel("Y, μm (Width from center)")
-        ax.plot([0, 100, 100], [7.5, 7.5, 0], "c--", linewidth=1.5, label="MZI Heater Boundary")
-        ax.legend(loc="upper right")
-
-    cbar = fig.colorbar(tc, ax=axes.ravel().tolist(), shrink=0.85)
-    cbar.set_label("Local Overheating ΔT (K)", fontsize=11)
-    plt.suptitle("3D FEM Verification: Surface Thermal Profile of Photonic Chip", fontsize=14, fontweight="bold")
-    plt.tight_layout()
-    plt.savefig("fem_3d_profile.png", dpi=300)
-    plt.show()
+    print("Material | dT_act (K) | dT_nbr (K) | Crosstalk | Tile Memory")
+    print("-" * 64)
+    for name, k, rcp in [("Si", 148.0, 1.63e6), ("BAs", 1300.0, 1.85e6)]:
+        da, dn, xt, mem = solve_3d_thermal_fdm(k, rcp)
+        print(f"{name:8s} | {da:10.3f} | {dn:10.3f} | {xt:9.3f} | {mem:11.3f}")
