@@ -1,6 +1,5 @@
 import numpy as np
-from part1 import *
-
+from part1 import VDW, TARGETS, SUBS, find_pdb, load_pdb_targeted, build_w
 
 def build_x(poses, px, r0, a=0.88):
     M, K = len(poses), len(r0)
@@ -11,7 +10,6 @@ def build_x(poses, px, r0, a=0.88):
         r12[:, c], r6[:, c] = re ** (-12), re ** (-6)
     return np.vstack((r12, r6))
 
-
 def quant(X, b=8):
     K, l, Xq = len(X) // 2, (2 ** b) - 1, np.zeros_like(X)
     for s in (slice(0, K), slice(K, 2 * K)):
@@ -19,18 +17,22 @@ def quant(X, b=8):
         Xq[s] = X[s] if mx == 0 else np.round((X[s] / mx) * l) / l * mx
     return Xq
 
-
-def therm(ks, na=100, ph=0.015):
+def therm(ks, na=100, ph=0.015, t_sw=5e-6):
     ah = 200e-6 * 15e-6
     rl, ra = np.sqrt(ah / np.pi), np.sqrt(na * ah * 4 / np.pi)
     dt = 1.25 * ph * (0.3e-6 / (1.4 * ah) + 1e-8 / ah + 1 / (2 * np.pi * ks * rl)) + (na * ph) / (2 * np.pi * ks * ra)
     dp = (2 * np.pi / 1550e-9) * 1.86e-4 * dt * 200e-6
-    sc = np.sqrt(148.0 / ks)
-    return dt, dp, 0.40 * sc, 0.20 * sc
-
+    alpha = ks / 1.75e6
+    tau_diff = (50e-6 ** 2) / alpha
+    mem_factor = float(np.exp(-t_sw / (tau_diff + 5.5e-6)))
+    xtalk_sigma = 0.164 * (148.0 / ks) ** 0.85
+    return dt, dp, mem_factor, float(xtalk_sigma)
 
 def sim(W, Xq, dp, mc, xs, na=100, b=8, dn=0.025, lim=25.0):
-    K, M, ea, l = len(W) // 2, Xq.shape[1], np.zeros(Xq.shape[1]), (2 ** b) - 1
+    K = len(W) // 2
+    _, M = Xq.shape
+    l = (2 ** b) - 1
+    ea = np.zeros(M)
     for s in (slice(0, K), slice(K, 2 * K)):
         wc, xc = W[s], Xq[s, :]
         mx = np.max(np.abs(wc))
@@ -47,53 +49,70 @@ def sim(W, Xq, dp, mc, xs, na=100, b=8, dn=0.025, lim=25.0):
     ad = np.clip(ea, -lim, lim)
     return ad + np.random.normal(0, dn * (np.std(ad) or 1e-6), ad.shape)
 
+def rot_mat(ax, ay, az):
+    cx, sx = np.cos(ax), np.sin(ax)
+    cy, sy = np.cos(ay), np.sin(ay)
+    cz, sz = np.cos(az), np.sin(az)
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]])
+    ry = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
+    rz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]])
+    return rz @ rx @ ry
 
-def gen_poses(lx, bc, M=500, R=5.0):
+def gen_poses_targeted(lx, bc, M=2000, R=3.5):
     lc, gr, ps = lx - np.mean(lx, axis=0), (1 + np.sqrt(5)) / 2, []
-    for i in range(M):
-        t, p, s = 2 * np.pi * i / gr, np.arccos(1 - 2 * (i + 0.5) / M), 2 * np.pi * i * 7 / M
-        rz = [[np.cos(t), -np.sin(t), 0], [np.sin(t), np.cos(t), 0], [0, 0, 1]]
-        rx = [[1, 0, 0], [0, np.cos(p), -np.sin(p)], [0, np.sin(p), np.cos(p)]]
-        ry = [[np.cos(s), 0, np.sin(s)], [0, 1, 0], [-np.sin(s), 0, np.cos(s)]]
+    n_near = max(10, int(0.02 * M))
+    for _ in range(n_near):
+        ax, ay, az = np.random.normal(0, 0.18, 3)
+        ps.append((lc @ rot_mat(ax, ay, az).T) + bc + np.random.normal(0, 0.45, 3))
+    for i in range(M - n_near):
+        t = 2 * np.pi * i / gr
+        p = np.arccos(1 - 2 * (i + 0.5) / (M - n_near))
+        s = 2 * np.pi * i * 7 / (M - n_near)
         rs = R * (((i * 0.61803398875) % 1) ** (1 / 3))
         sh = np.array([np.sin(p) * np.cos(t), np.sin(p) * np.sin(t), np.cos(p)]) * rs
-        ps.append((lc @ (np.array(rz) @ rx @ ry).T) + bc + sh)
+        ps.append((lc @ rot_mat(p, s, t).T) + bc + sh)
     return ps
 
+def calc_ef(scores, is_active, top_frac=0.05):
+    M = len(scores)
+    k = max(1, int(M * top_frac))
+    top_idx = np.argsort(scores)[:k]
+    total_act = np.sum(is_active)
+    if total_act == 0:
+        return 0.0
+    return (np.sum(is_active[top_idx]) / k) / (total_act / M)
 
 rmsd = lambda a, b: np.sqrt(np.mean(np.sum((a - b) ** 2, axis=1)))
 
-
 if __name__ == "__main__":
+    np.random.seed(42)
     sp = {n: therm(k) for n, k in SUBS}
-    for n, k in SUBS:
-        print(f"{n:6s}: dT={sp[n][0]:.2f} K  dPhi={sp[n][1]:.3f} rad")
-    print("-" * 65)
-    agg = {n: [] for n, _ in SUBS}
-    cr, nr = [], []
+    print(f"{'PDB':5s} | {'Si EF5%':7s} | {'BAs EF5%':8s} | {'CPU EF5%':8s} | {'BAs Native-RMSD (A)':19s}")
+    print("-" * 62)
+    agg_si, agg_bas, agg_cpu, agg_rmsd = [], [], [], []
     for pid, lc in TARGETS:
         fp = find_pdb(pid)
-        px, pe, lx, le, bc = load_pdb(fp, lc)
-        ps = gen_poses(lx, bc)
+        px, pe, lx, le, bc = load_pdb_targeted(fp, lc, npock=60)
+        ps = gen_poses_targeted(lx, bc, M=2000, R=3.5)
+        rmsds = np.array([rmsd(p, lx) for p in ps])
+        is_act = rmsds < 2.0
         _, r0 = build_w(pe, le)
         X = build_x(ps, px, r0)
         Xq = quant(X)
-        h = {n: 0 for n, _ in SUBS}
-        c_l, n_l = [], []
+        ef_si, ef_bas, ef_cpu, nrmsd = [], [], [], []
         for _ in range(100):
             W, _ = build_w(pe, le, np.random.uniform(0.85, 1.15), np.random.uniform(0.95, 1.05))
-            bt = np.argmin(W @ X)
-            for n, _ in SUBS:
-                t3 = np.argsort(sim(W, Xq, sp[n][1], sp[n][2], sp[n][3]))[:3]
-                if bt in t3:
-                    h[n] += 1
-                if n == "BAs":
-                    c_l.append(min(rmsd(ps[i], ps[bt]) for i in t3))
-                    n_l.append(min(rmsd(ps[i], lx) for i in t3))
-        for n in h:
-            agg[n].append(h[n])
-        cr.append(np.mean(c_l))
-        nr.append(np.mean(n_l))
-        print(f"{pid} | Si:{h['Si']:4.1f} AlN:{h['AlN']:4.1f} SiC:{h['4H-SiC']:4.1f} BAs:{h['BAs']:4.1f} | RMSD:{cr[-1]:.2f}/{nr[-1]:.2f}")
-    print("-" * 65)
-    print(f"MEAN | Si:{np.mean(agg['Si']):4.1f} AlN:{np.mean(agg['AlN']):4.1f} SiC:{np.mean(agg['4H-SiC']):4.1f} BAs:{np.mean(agg['BAs']):4.1f} | RMSD:{np.mean(cr):.2f}/{np.mean(nr):.2f}")
+            ef_cpu.append(calc_ef(W @ X, is_act, 0.05))
+            _, dp_s, mc_s, xs_s = sp["Si"]
+            ef_si.append(calc_ef(sim(W, Xq, dp_s, mc_s, xs_s), is_act, 0.05))
+            _, dp_b, mc_b, xs_b = sp["BAs"]
+            e_bas = sim(W, Xq, dp_b, mc_b, xs_b)
+            ef_bas.append(calc_ef(e_bas, is_act, 0.05))
+            nrmsd.append(np.min(rmsds[np.argsort(e_bas)[:5]]))
+        agg_si.append(np.mean(ef_si))
+        agg_bas.append(np.mean(ef_bas))
+        agg_cpu.append(np.mean(ef_cpu))
+        agg_rmsd.append(np.mean(nrmsd))
+        print(f"{pid:5s} | {agg_si[-1]:7.2f} | {agg_bas[-1]:8.2f} | {agg_cpu[-1]:8.2f} | {agg_rmsd[-1]:19.2f}")
+    print("-" * 62)
+    print(f"{'MEAN':5s} | {np.mean(agg_si):7.2f} | {np.mean(agg_bas):8.2f} | {np.mean(agg_cpu):8.2f} | {np.mean(agg_rmsd):19.2f}")
