@@ -21,7 +21,7 @@ Evaluated across 10 therapeutic protein targets from RCSB PDB (`2VUK`, `1HSG`, `
 * `part2.py` — Soft-Core LJ feature matrix (`build_x`), 8-bit channel quantization (`quant`), physics-based thermal diffusion model (`therm`), MZI transfer simulator (`sim`), and targeted screening benchmark (`EF 5%`).
 * `fem_3d_numpy.py` — 3D finite-difference heat conduction solver verifying lateral crosstalk and inter-tile thermal memory.
 * `bench_100k.py` — Batched scaling benchmark for $M = 100\,000$ conformations on `2VUK`.
-* - `sens.py` — Substrate thermal conductivity sensitivity analysis ($\kappa_{\text{sub}} \in [100, 1300]\text{ W/(m}\cdot\text{K)}$) evaluating accelerator stability against crystal lattice defects on the EGFR (`1M17`) target.
+* `sens.py` — Substrate thermal conductivity sensitivity analysis ($\kappa_{\text{sub}} \in [100, 1300]\text{ W/(m}\cdot\text{K)}$) evaluating accelerator stability against crystal lattice defects on the EGFR (`1M17`) target.
 
 
 ## Quick Start
