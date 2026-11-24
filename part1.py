@@ -1,98 +1,47 @@
-import os
-import urllib.request
 import numpy as np
 
-np.random.seed(42)
+def solve_3d_thermal_fdm(k_sub, rho_cp, pitch_um=25.0, t_sw=5e-6):
+    nx, ny, nz = 26, 41, 27
+    dx, dy, dz = 10e-6, 2.5e-6, 2e-6
+    k = np.full((nx, ny, nz), k_sub, dtype=np.float64)
+    k[:, :, -1] = 1.4
+    Q = np.zeros((nx, ny, nz), dtype=np.float64)
+    P_heater = 15e-3
+    vol_heater = 100e-6 * 7.5e-6 * dz
+    Q[:11, :4, -1] = (P_heater / 4.0) / vol_heater
+    T = np.zeros((nx, ny, nz), dtype=np.float64)
 
-VDW = {
-    "C": (1.938, 0.086),
-    "N": (1.824, 0.170),
-    "O": (1.661, 0.210),
-    "S": (2.000, 0.250),
-}
+    kx_p = 2 * k[:-1, :, :] * k[1:, :, :] / (k[:-1, :, :] + k[1:, :, :]) / (dx ** 2)
+    ky_p = 2 * k[:, :-1, :] * k[:, 1:, :] / (k[:, :-1, :] + k[:, 1:, :]) / (dy ** 2)
+    kz_p = 2 * k[:, :, :-1] * k[:, :, 1:] / (k[:, :, :-1] + k[:, :, 1:]) / (dz ** 2)
 
-TARGETS = [
-    ("2VUK", "P83"), ("1HSG", "MK1"),
-    ("3ERT", "OHT"), ("1M17", "AQ4"),
-    ("1IEP", "STI"), ("2HYY", "STI"),
-    ("1EVE", "E20"), ("1CX2", "S58"),
-    ("1FJS", "Z34"), ("1U1C", "BAU"),
-]
+    for _ in range(1500):
+        T_pad = np.pad(T, ((1, 1), (1, 1), (1, 1)), mode="edge")
+        T_pad[:, :, 0] = 0.0
+        flux_x = np.pad(kx_p, ((1, 0), (0, 0), (0, 0)), mode="edge") * (T_pad[:-2, 1:-1, 1:-1] - T) + \
+                 np.pad(kx_p, ((0, 1), (0, 0), (0, 0)), mode="edge") * (T_pad[2:, 1:-1, 1:-1] - T)
+        flux_y = np.pad(ky_p, ((0, 0), (1, 0), (0, 0)), mode="edge") * (T_pad[1:-1, :-2, 1:-1] - T) + \
+                 np.pad(ky_p, ((0, 0), (0, 1), (0, 0)), mode="edge") * (T_pad[1:-1, 2:, 1:-1] - T)
+        flux_z = np.pad(kz_p, ((0, 0), (0, 0), (1, 0)), mode="edge") * (T_pad[1:-1, 1:-1, :-2] - T) + \
+                 np.pad(kz_p, ((0, 0), (0, 0), (0, 1)), mode="edge") * (T_pad[1:-1, 1:-1, 2:] - T)
+        denom = np.pad(kx_p, ((1, 0), (0, 0), (0, 0)), mode="edge") + np.pad(kx_p, ((0, 1), (0, 0), (0, 0)), mode="edge") + \
+                np.pad(ky_p, ((0, 0), (1, 0), (0, 0)), mode="edge") + np.pad(ky_p, ((0, 0), (0, 1), (0, 0)), mode="edge") + \
+                np.pad(kz_p, ((0, 0), (0, 0), (1, 0)), mode="edge") + np.pad(kz_p, ((0, 0), (0, 0), (0, 1)), mode="edge")
+        T = T + 0.8 * ((flux_x + flux_y + flux_z + Q) / denom)
+        T[:, :, 0] = 0.0
 
-SUBS = [
-    ("Si", 148.0),
-    ("AlN", 285.0),
-    ("4H-SiC", 370.0),
-    ("BAs", 1300.0),
-]
+    idx_nbr = int(round((pitch_um * 1e-6) / dy))
+    dT_act = float(np.mean(T[:11, :4, -1]))
+    dT_nbr = float(np.mean(T[:11, max(0, idx_nbr - 2):idx_nbr + 3, -1]))
+    xtalk = dT_nbr / dT_act
+    alpha = k_sub / rho_cp
+    tau_diff = (50e-6 ** 2) / alpha
+    mem = float(np.exp(-t_sw / (tau_diff + 5.5e-6)))
+    return dT_act, dT_nbr, xtalk, mem
 
-
-def find_pdb(pid):
-    dirs = [".", "pdb"]
-    for d in dirs:
-        for n in (pid + ".pdb", pid.lower() + ".pdb"):
-            p = os.path.join(d, n)
-            if os.path.exists(p):
-                return p
-    os.makedirs("pdb", exist_ok=True)
-    url = f"https://rcsb.org{pid}.pdb"
-    dst = os.path.join("pdb", f"{pid}.pdb")
-    urllib.request.urlretrieve(url, dst)
-    return dst
-
-
-def find_blind_pocket(px, step=2.0):
-    x0, y0, z0 = np.min(px, axis=0) + 4.0
-    x1, y1, z1 = np.max(px, axis=0) - 4.0
-    g = np.mgrid[x0:x1:step, y0:y1:step, z0:z1:step].reshape(3, -1).T
-    if len(g) == 0:
-        return np.mean(px, axis=0)
-    best_pt, best_sc = np.mean(px, axis=0), -1
-    for pt in g:
-        d = np.linalg.norm(px - pt, axis=1)
-        if np.min(d) < 3.2:
-            continue
-        sc = np.sum((d >= 4.0) & (d <= 9.0))
-        if sc > best_sc:
-            best_sc, best_pt = sc, pt
-    return best_pt
-
-
-def load_pdb(fp, lc, npock=40):
-    pc, pe, lco, le, lch = [], [], [], [], None
-    with open(fp, "r", errors="ignore") as f:
-        for l in f:
-            r = l[:6].strip()
-            if r not in ("ATOM", "HETATM") or l[16:17] not in (" ", "A", ""):
-                continue
-            el = l[76:78].strip().upper() or "".join(c for c in l[12:16] if c.isalpha())[:1]
-            if el not in VDW:
-                continue
-            xyz = [float(l[30:38]), float(l[38:46]), float(l[46:54])]
-            if r == "HETATM" and l[17:20].strip() == lc:
-                if lch is None:
-                    lch = l[21:22]
-                if l[21:22] == lch:
-                    lco.append(xyz)
-                    le.append(el)
-            elif r == "ATOM":
-                pc.append(xyz)
-                pe.append(el)
-    px, lx = np.array(pc), np.array(lco)
-    bc = find_blind_pocket(px)
-    idx = np.argsort(np.linalg.norm(px - bc, axis=1))[:npock]
-    return px[idx], [pe[i] for i in idx], lx, le, bc
-
-
-def build_w(pe, le, bs=1.0, rs=1.0):
-    al, bl, r0l = [], [], []
-    for ep in pe:
-        rp, vp = VDW[ep]
-        for el in le:
-            rl, vl = VDW[el]
-            r0 = (rp + rl) * rs
-            eps = np.sqrt(vp * vl) * bs
-            al.append(eps * (r0 ** 12))
-            bl.append(2.0 * eps * (r0 ** 6))
-            r0l.append(r0)
-    return np.concatenate((al, -np.array(bl))), np.array(r0l)
+if __name__ == "__main__":
+    print("Material | dT_act (K) | dT_nbr (K) | Crosstalk | Tile Memory")
+    print("-" * 64)
+    for name, k, rcp in [("Si", 148.0, 1.63e6), ("BAs", 1300.0, 1.85e6)]:
+        da, dn, xt, mem = solve_3d_thermal_fdm(k, rcp)
+        print(f"{name:8s} | {da:10.3f} | {dn:10.3f} | {xt:9.3f} | {mem:11.3f}")
